@@ -1,155 +1,263 @@
-// Tiny trend bot for "Tiny Bot, Easy $2: Beat Buy-and-Hold on Solana".
+// Trend-following bot for "Tiny Bot, Easy $2: Beat Buy-and-Hold on Solana".
 //
-// hello: the harness greets the bot once, then sends one batch of bars per
-// hour; this bot answers each batch with its orders for that bar, and stays
-// silent (no orders) while the batch is still warm-up. One bar at a time,
-// per symbol: ride an uptrend, sit in cash in a downtrend, cut losers fast.
+// Protocol in one breath: the harness opens with a hello, then sends one
+// batch per hour; each batch carries that hour's bar for every symbol plus
+// the fills of the orders decided on the previous bar. The bot answers each
+// batch with the orders it wants filled at the next bar's open, and answers
+// warm-up batches with no orders at all.
 //
-// Strategy, per symbol, from its hourly closes only:
-//   - fast EMA (8 bars) vs slow EMA (24 bars) + 12-bar momentum decide the
-//     target weight: 20% of equity when the trend is up, 0% when it is down.
-//   - an overextended price (close > 10% above the slow EMA) halves the
-//     target, so the bot does not chase a vertical bar.
-//   - risk exits: sell everything when a held position falls 7% below its
-//     cost, or 8% below its own peak value; after any exit the symbol is
-//     cooled off for 12 bars so a choppy market cannot whipsaw it back in.
-//   - targets are capped so total desired exposure stays under 90% of
-//     equity; buys never exceed the cash on hand (a sell's proceeds never
-//     fund a buy in the same reply).
-// Everything is deterministic: no clock, no environment, no randomness.
+// How it tries to beat buy-and-hold: never hold a symbol whose trend is not
+// demonstrably up, and re-prove that trend on every bar. Buy-and-hold eats
+// every dip of every asset for the whole window; this bot sits in USDC
+// through downtrends and only rents exposure while momentum lasts, which
+// caps the damage in a falling market and keeps most of the upside in a
+// rising one. Position size follows trend strength, trimmed for jumpy
+// symbols and for prices that have run too far ahead of their own trend.
+//
+// Per symbol, from hourly closes only:
+//   - trend spread: EMA(12) vs EMA(36), in bps of the slow EMA; momentum:
+//     close vs the close 12 bars ago, in bps.
+//   - entry gate (checked for new positions): spread above +30 bps AND
+//     momentum at least +100 bps. A held position must keep passing a
+//     near-identical gate every bar (spread positive, momentum above
+//     +100 bps); the bar it fails, the position is closed and the symbol
+//     cools off for 8 bars. This tight leash is deliberate: looser exits
+//     were backtested on the dev window and bled in its choppy downtrend.
+//   - target weight by strength score (spread + momentum/2): tiers of
+//     2200 / 1500 / 900 bps of equity, scaled to 2/3 or 1/2 when the
+//     symbol's mean hourly move over 14 bars exceeds 200 / 450 bps, and
+//     halved when the close runs more than 8% above the slow EMA (never
+//     opened at all beyond 15%: that is chasing a vertical bar).
+//   - price stops override the trend: exit at 6% under the average cost
+//     price, or 9% under the highest close since entry; a stop locks the
+//     symbol out for 10 bars.
+//   - summed targets are capped at 85% of equity, rebalances inside a band
+//     (the larger of 2 USDC or an eighth of the target) are skipped, sells
+//     go first and never fund same-reply buys, and buys are filled
+//     strongest-target-first out of the cash actually on hand.
+// Fully deterministic: integer math only, no clock, no environment, no
+// randomness, so the two grading runs produce identical orders.
 
 import { runBars } from './vendor/makefun-bars.ts';
 import type { BarsState, Batch, OrderInput } from './vendor/makefun-bars.ts';
 
-const FAST_N = 12n;
-const SLOW_N = 36n;
-const MOM_BARS = 12;
-const MOM_MIN_BPS = 100n; // need a real 12-bar rise, not a dead-cat bounce
-const MIN_HISTORY = 37;
-const TARGET_BPS = 2000n; // 20% of equity per trending symbol
-const MAX_TOTAL_BPS = 10000n; // 100% of equity across all symbols when all trend up
-const EXTEND_BPS = 1000n; // >10% above slow EMA counts as overextended
-const STOP_BPS = 700n; // 7% below cost -> exit
-const TRAIL_BPS = 800n; // 8% below peak value -> exit
-const MIN_TRADE = 2_000_000n; // 2 USDC, above the 1 USDC minimum notional
-const SLIPPAGE_BPS = 200;
+// ---- tunables (bps are 1/100 of a percent; bars are hours) ----
+const FAST_N = 12n; // fast EMA length
+const SLOW_N = 36n; // slow EMA length
+const MOM_BARS = 12; // momentum lookback
+const VOL_BARS = 14; // volatility lookback
+const MIN_HISTORY = 37; // closes needed before a symbol can be traded
+const KEEP = 48; // closes retained per symbol (covers every lookback)
 
-interface SymState {
-  closes: bigint[];
-  fast: bigint | null;
-  slow: bigint | null;
-  peak: bigint; // peak held value in quote units
-  coolUntil: number; // seq before which the symbol may not be re-entered
+const ENTER_SPREAD_BPS = 30n; // new entries need the fast EMA this far ahead
+const ENTER_MOM_BPS = 100n; // ...and at least this much 12-bar momentum
+const HOLD_MOM_BPS = 100n; // a held position is closed at or under this
+
+const TIER1_SCORE = 250n; // strength-score thresholds for the weight tiers
+const TIER2_SCORE = 120n;
+const TIER3_SCORE = 50n;
+const TIER1_BPS = 2200n; // target weight per tier, bps of equity
+const TIER2_BPS = 1500n;
+const TIER3_BPS = 900n;
+
+const EXTEND_HALVE_BPS = 800n; // close this far over the slow EMA: half size
+const EXTEND_BLOCK_BPS = 1500n; // this far over: no position at all
+const VOL_CALM_BPS = 200n; // mean hourly move at or under this: full weight
+const VOL_WILD_BPS = 450n; // between: 2/3 weight; above: 1/2 weight
+
+const HARD_STOP_BPS = 600n; // exit at 6% under average cost price
+const TRAIL_STOP_BPS = 900n; // exit at 9% under the best close since entry
+const STOP_COOL_BARS = 10; // lockout after a stop exit
+const TREND_COOL_BARS = 8; // lockout after a trend-gate exit
+
+const MAX_TOTAL_BPS = 8500n; // cap on summed target weights
+const BAND_MIN = 2_000_000n; // 2 USDC: smallest rebalance worth its fee
+const SLIPPAGE_BPS = 300; // bound the next-open move we accept on a fill
+
+interface Track {
+  closes: bigint[]; // last KEEP closes, oldest first
+  fast: bigint | null; // EMA(FAST_N) of the closes
+  slow: bigint | null; // EMA(SLOW_N) of the closes
+  peakClose: bigint; // highest close seen while holding (0n while flat)
+  coolUntil: number; // first seq at which the symbol may be re-entered
 }
 
-const per: Map<string, SymState> = new Map();
+const tracks = new Map<string, Track>();
 
-function ema(prev: bigint | null, price: bigint, n: bigint): bigint {
+function trackOf(symbol: string): Track {
+  let t = tracks.get(symbol);
+  if (t === undefined) {
+    t = { closes: [], fast: null, slow: null, peakClose: 0n, coolUntil: -1 };
+    tracks.set(symbol, t);
+  }
+  return t;
+}
+
+function emaStep(prev: bigint | null, price: bigint, n: bigint): bigint {
   if (prev === null) return price;
   return (price * 2n + prev * (n - 1n)) / (n + 1n);
 }
 
-function qtyForValue(state: BarsState, symbol: string, quoteUnits: bigint): bigint {
-  const sym = state.symbols.get(symbol);
-  const price = state.close(symbol);
-  if (sym === undefined || price === null || price === 0n) return 0n;
-  const scale = 10n ** BigInt(sym.qty_scale + sym.price_scale);
-  const quote = 10n ** BigInt(state.hello.capital.quote_scale);
-  return (quoteUnits * scale) / (price * quote);
+/** Signed change from `from` to `to` in bps; 0 when `from` is unusable. */
+function changeBps(from: bigint, to: bigint): bigint {
+  if (from <= 0n) return 0n;
+  return ((to - from) * 10_000n) / from;
 }
 
-function targetBps(s: SymState, close: bigint, seq: number): bigint {
-  if (seq < s.coolUntil) return 0n;
-  if (s.fast === null || s.slow === null || s.closes.length < MIN_HISTORY) return 0n;
-  if (s.fast <= s.slow) return 0n;
-  const old = s.closes[s.closes.length - 1 - MOM_BARS];
-  if (old === undefined || old === 0n) return 0n;
-  const momBps = ((close - old) * 10_000n) / old;
-  if (momBps <= MOM_MIN_BPS) return 0n;
-  const overBps = ((close - s.slow) * 10_000n) / s.slow;
-  return overBps > EXTEND_BPS ? TARGET_BPS / 2n : TARGET_BPS;
+/** Mean absolute bar-to-bar move over the last VOL_BARS closes, in bps. */
+function meanMoveBps(closes: bigint[]): bigint {
+  const n = Math.min(VOL_BARS, closes.length - 1);
+  if (n <= 0) return 0n;
+  let sum = 0n;
+  for (let i = closes.length - n; i < closes.length; i++) {
+    const step = changeBps(closes[i - 1]!, closes[i]!);
+    sum += step < 0n ? -step : step;
+  }
+  return sum / BigInt(n);
+}
+
+/** Average cost price of a held position, from its cost basis and quantity. */
+function avgCostPrice(state: BarsState, symbol: string): bigint | null {
+  const pos = state.positions.get(symbol);
+  const meta = state.symbols.get(symbol);
+  if (pos === undefined || meta === undefined || pos.qty <= 0n) return null;
+  const scales = 10n ** BigInt(meta.qty_scale + meta.price_scale);
+  const quote = 10n ** BigInt(state.hello.capital.quote_scale);
+  return (pos.cost * scales) / (pos.qty * quote);
+}
+
+/** Quantity of `symbol` worth `quoteUnits` at its latest close. */
+function qtyWorth(state: BarsState, symbol: string, quoteUnits: bigint): bigint {
+  const meta = state.symbols.get(symbol);
+  const price = state.close(symbol);
+  if (meta === undefined || price === null || price <= 0n) return 0n;
+  const scales = 10n ** BigInt(meta.qty_scale + meta.price_scale);
+  const quote = 10n ** BigInt(state.hello.capital.quote_scale);
+  return (quoteUnits * scales) / (price * quote);
+}
+
+/**
+ * Desired weight for one symbol in bps of equity, before the portfolio cap.
+ * Side effect: a stop exit or a trend-gate exit starts the symbol's
+ * cooldown on its track, and the returned 0 applies from this bar on.
+ */
+function desiredBps(state: BarsState, t: Track, symbol: string, close: bigint): bigint {
+  const held = (state.positions.get(symbol)?.qty ?? 0n) > 0n;
+  if (!held) t.peakClose = 0n;
+  if (t.closes.length < MIN_HISTORY || t.fast === null || t.slow === null || t.slow <= 0n) return 0n;
+
+  // Price stops first: they override any trend reading.
+  if (held) {
+    if (close > t.peakClose) t.peakClose = close;
+    const entry = avgCostPrice(state, symbol);
+    const stoppedOut =
+      (entry !== null && changeBps(entry, close) <= -HARD_STOP_BPS) ||
+      (t.peakClose > 0n && changeBps(t.peakClose, close) <= -TRAIL_STOP_BPS);
+    if (stoppedOut) {
+      t.coolUntil = state.seq + STOP_COOL_BARS;
+      return 0n;
+    }
+  }
+  if (state.seq < t.coolUntil) return 0n;
+
+  const spread = changeBps(t.slow, t.fast);
+  const ref = t.closes[t.closes.length - 1 - MOM_BARS];
+  const mom = ref === undefined ? 0n : changeBps(ref, close);
+
+  if (held) {
+    // The leash: a position must keep proving its trend on every bar.
+    if (spread <= 0n || mom <= HOLD_MOM_BPS) {
+      t.coolUntil = state.seq + TREND_COOL_BARS;
+      return 0n;
+    }
+  } else if (spread <= ENTER_SPREAD_BPS || mom < ENTER_MOM_BPS) {
+    return 0n;
+  }
+
+  const score = spread + mom / 2n;
+  let weight = score >= TIER1_SCORE ? TIER1_BPS : score >= TIER2_SCORE ? TIER2_BPS : score >= TIER3_SCORE ? TIER3_BPS : 0n;
+  if (weight === 0n) return 0n;
+
+  // Do not chase a price that has sprinted away from its own trend line.
+  const extension = changeBps(t.slow, close);
+  if (extension > EXTEND_BLOCK_BPS) return 0n;
+  if (extension > EXTEND_HALVE_BPS) weight = weight / 2n;
+
+  // Jumpy symbols get less room: the replay caps drawdown at 25%.
+  const vol = meanMoveBps(t.closes);
+  if (vol > VOL_WILD_BPS) weight = weight / 2n;
+  else if (vol > VOL_CALM_BPS) weight = (weight * 2n) / 3n;
+  return weight;
 }
 
 await runBars({
   onBatch(state: BarsState, batch: Batch): OrderInput[] {
-    // Fold this batch's bars into per-symbol history first.
+    // History first: fold this batch's bar for each symbol into its track.
     for (const bar of batch.bars) {
-      let s = per.get(bar.symbol);
-      if (s === undefined) {
-        s = { closes: [], fast: null, slow: null, peak: 0n, coolUntil: -1 };
-        per.set(bar.symbol, s);
-      }
+      const t = trackOf(bar.symbol);
       const close = BigInt(bar.c);
-      s.closes.push(close);
-      s.fast = ema(s.fast, close, FAST_N);
-      s.slow = ema(s.slow, close, SLOW_N);
+      t.closes.push(close);
+      if (t.closes.length > KEEP) t.closes.shift();
+      t.fast = emaStep(t.fast, close, FAST_N);
+      t.slow = emaStep(t.slow, close, SLOW_N);
     }
     if (state.warmingUp) return [];
 
-    const orders: OrderInput[] = [];
     const symbols = [...state.symbols.keys()];
 
-    // Desired weight per symbol, then scale down if the total is too big.
+    // One target weight per symbol, then one shared scale-down if the book
+    // as a whole would run past the exposure cap.
     const targets = new Map<string, bigint>();
-    let total = 0n;
+    let summed = 0n;
     for (const symbol of symbols) {
-      const s = per.get(symbol);
       const close = state.close(symbol);
-      if (s === undefined || close === null) continue;
-      // Risk exits override the trend target for a held position.
-      const pos = state.positions.get(symbol);
-      if (pos !== undefined && pos.qty > 0n) {
-        const value = state.value(symbol, pos.qty);
-        if (value > s.peak) s.peak = value;
-        const belowCost = value < (pos.cost * (10_000n - STOP_BPS)) / 10_000n;
-        const belowPeak = value < (s.peak * (10_000n - TRAIL_BPS)) / 10_000n;
-        if (belowCost || belowPeak) {
-          targets.set(symbol, 0n);
-          s.coolUntil = state.seq + 12; // no re-entry for 12 bars after a stop
-          continue;
-        }
-      } else {
-        s.peak = 0n;
-      }
-      const t = targetBps(s, close, state.seq);
-      if (t === 0n && pos !== undefined && pos.qty > 0n) {
-        s.coolUntil = state.seq + 12; // trend flipped while holding: cool off too
-      }
-      targets.set(symbol, t);
-      total += t;
+      if (close === null) continue;
+      const w = desiredBps(state, trackOf(symbol), symbol, close);
+      targets.set(symbol, w);
+      summed += w;
     }
-    const scale = total > MAX_TOTAL_BPS ? (MAX_TOTAL_BPS * 10_000n) / total : 10_000n;
-
-    // Sells first (their proceeds do not fund buys in this same reply).
-    for (const symbol of symbols) {
-      const t = targets.get(symbol);
-      if (t === undefined) continue;
-      const pos = state.positions.get(symbol);
-      if (pos === undefined || pos.qty === 0n) continue;
-      const desired = (t * scale * state.equity) / 100_000_000n;
-      const current = state.value(symbol, pos.qty);
-      if (current - desired <= MIN_TRADE) continue;
-      const qty = qtyForValue(state, symbol, current - desired);
-      const sellQty = qty > pos.qty ? pos.qty : qty;
-      if (sellQty > 0n) {
-        orders.push({ side: 'sell', symbol, qty: sellQty, max_slippage_bps: SLIPPAGE_BPS });
-      }
-    }
-
-    // Buys sized to the cash actually on hand.
-    let cash = state.cash;
-    for (const symbol of symbols) {
-      const t = targets.get(symbol);
-      if (t === undefined) continue;
-      const desired = (t * scale * state.equity) / 100_000_000n;
+    const scaleNum = summed > MAX_TOTAL_BPS ? MAX_TOTAL_BPS : summed;
+    const scaleDen = summed > 0n ? summed : 1n;
+    const desiredValue = (symbol: string): bigint => {
+      const w = targets.get(symbol) ?? 0n;
+      return (w * scaleNum * state.equity) / (scaleDen * 10_000n);
+    };
+    const outsideBand = (symbol: string): bigint => {
+      // Signed gap between target and current value; 0 inside the band.
       const pos = state.positions.get(symbol);
       const current = pos === undefined ? 0n : state.value(symbol, pos.qty);
-      if (desired - current <= MIN_TRADE) continue;
-      let spend = desired - current;
+      const target = desiredValue(symbol);
+      const gap = target - current;
+      const band = target / 8n > BAND_MIN ? target / 8n : BAND_MIN;
+      return gap > band || gap < -band ? gap : 0n;
+    };
+
+    const orders: OrderInput[] = [];
+
+    // Sells first: a sell's proceeds never fund a buy in the same reply.
+    for (const symbol of symbols) {
+      if (!targets.has(symbol)) continue;
+      const gap = outsideBand(symbol);
+      if (gap >= 0n) continue;
+      const pos = state.positions.get(symbol);
+      if (pos === undefined || pos.qty === 0n) continue;
+      const qty = qtyWorth(state, symbol, -gap);
+      const sellQty = qty > pos.qty ? pos.qty : qty;
+      if (sellQty > 0n) orders.push({ side: 'sell', symbol, qty: sellQty, max_slippage_bps: SLIPPAGE_BPS });
+    }
+
+    // Buys, strongest target first, so the cash on hand goes to the best
+    // trends when there is not enough for all of them.
+    let cash = state.cash;
+    const buyable = symbols
+      .filter((s) => targets.has(s) && outsideBand(s) > 0n)
+      .sort((a, b) => Number((targets.get(b) ?? 0n) - (targets.get(a) ?? 0n)) || (a < b ? -1 : 1));
+    for (const symbol of buyable) {
+      let spend = outsideBand(symbol);
       const room = state.weightRoom(symbol);
       if (spend > room) spend = room;
-      if (spend > (cash * 95n) / 100n) spend = (cash * 95n) / 100n;
-      if (spend <= MIN_TRADE) continue;
+      if (spend > (cash * 98n) / 100n) spend = (cash * 98n) / 100n;
+      if (spend < BAND_MIN) continue;
       orders.push({ side: 'buy', symbol, notional_quote_units: spend, max_slippage_bps: SLIPPAGE_BPS });
       cash -= spend;
     }
